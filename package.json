@@ -1,0 +1,15 @@
+{
+  "name": "chinaedu-study",
+  "version": "1.1.0",
+  "description": "弘成教育(chinaedu.net)继续教育平台自动刷课脚本 - 基于 Playwright",
+  "main": "chinaedu-study.js",
+  "scripts": {
+    "start": "node chinaedu-study.js"
+  },
+  "keywords": ["chinaedu", "playwright", "auto-study", "继续教育"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}

@@ -1,0 +1,7 @@
+node_modules/
+auth-state.json
+learned-courses.json
+last-url.txt
+study.log
+browser-data/
+.DS_Store
