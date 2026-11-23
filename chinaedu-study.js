@@ -65,6 +65,14 @@ let learnedData = [];
 let logStream = null;
 let sectionList = [];
 let currentSectionIdx = 0;
+let context_global = null;   // 全局 context 引用（cstore 模式需要）
+
+// cstore 模式的登录状态保存（复用 saveAuthState 需要 context）
+async function saveAuthStateAsync(ctx) {
+  if (ctx && typeof saveAuthState === 'function') {
+    return await saveAuthState(ctx);
+  }
+}
 
 // ============ 工具函数 ============
 function log(msg) {
@@ -166,29 +174,46 @@ async function doLogin(page) {
 
     if (hasCaptcha) {
       log('');
-      log('  ╔══════════════════════════════════════════════╗');
-      log('  ║  ⚠️  检测到验证码！请手动完成登录：          ║');
-      log('  ║  1. 在浏览器中输入验证码                     ║');
-      log('  ║  2. 点击登录按钮                             ║');
-      log('  ║  3. 脚本会自动检测登录成功并继续              ║');
-      log('  ╚══════════════════════════════════════════════╝');
+      log('  ╔══════════════════════════════════════════════════════╗');
+      log('  ║  ⚠️  检测到验证码，请手动完成登录（最多等5分钟）      ║');
+      log('  ║                                                      ║');
+      log('  ║  1. 在浏览器里输入验证码                             ║');
+      log('  ║  2. 点击「登录」按钮                                 ║');
+      log('  ║  3. 登录成功后脚本会自动继续（会校验登录态）          ║');
+      log('  ╚══════════════════════════════════════════════════════╝');
       log('');
 
       // 等待用户手动登录，最多等5分钟
       for (let i = 0; i < 60; i++) {
         await sleep(5);
-        const currentUrl = page.url();
-        if (!currentUrl.includes('/login') && !currentUrl.includes('Login')) {
-          log('[登录] ✅ 登录成功！');
-          return true;
-        }
-        // 也检测页面内容变化（SPA可能不跳转URL）
-        const stillLogin = await page.evaluate(() => {
-          return document.querySelectorAll('input[type="password"]').length > 0;
+        // 校验方式：密码框消失 + 课程列表 API 返回正常JSON（双重校验，避免误判）
+        const noPassword = await page.evaluate(() => {
+          return document.querySelectorAll('input[type="password"]').length === 0;
         });
-        if (!stillLogin) {
-          log('[登录] ✅ 登录成功！（检测到密码框消失）');
+        if (!noPassword) continue;
+
+        // 二次校验：调用课程列表 API，确认登录态有效
+        const apiOk = await page.evaluate(async () => {
+          try {
+            const res = await fetch('/student/student/coursestudy/getlist', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ data: 'aggregation' }),
+            });
+            const text = await res.text();
+            if (text.includes('RedirectToLogin')) return false;
+            const json = JSON.parse(text);
+            return !!(json && (json.items || json.data));
+          } catch {
+            return false;
+          }
+        });
+
+        if (apiOk) {
+          log('[登录] ✅ 登录成功（已验证登录态有效）');
           return true;
+        } else if (i % 3 === 0) {
+          log(`[登录] 密码框已消失，但登录态尚未生效，继续等待... (${i * 5}s)`);
         }
       }
       log('[登录] ⏰ 等待超时（5分钟），请重新运行');
@@ -379,20 +404,422 @@ async function getAllSections(playFrame) {
   try {
     return await playFrame.evaluate(() => {
       const sections = [];
-      const links = document.querySelectorAll('a[href="javascript:;"]');
+
+      // 过滤黑名单文字
+      const blackList = ['首页', '课程讲解', '展开', '更多', '目录', '视频', '语音',
+        '登录', '退出', '个人中心', '注销', '返回', '上一页', '下一页', '关闭'];
+
+      // ——— 策略1：a[href="javascript:;"]，识别"第X讲"为 unit，子节为 section ———
+      const links1 = document.querySelectorAll('a[href="javascript:;"]');
       let currentUnit = '';
-      for (const link of links) {
+      for (const link of links1) {
         const text = link.textContent.trim();
-        if (!text || text === '首页' || text === '课程讲解' || text === '展开' || text === '更多' || text === '目录' || text === '视频' || text === '语音') continue;
-        if (text.startsWith('Unit ')) {
+        if (!text || text.length > 80 || blackList.includes(text)) continue;
+        // "第X讲" 或 "专题X" 或 "Unit X" 或 "第X章" 作为 unit
+        if (text.match(/^第\d+讲/) || text.match(/^专题[一二三四五六七八九十\d]+/) ||
+            text.match(/^(Unit|unit|UNIT)\s*\d+/i) || text.match(/^第\d+章/) || text.match(/^第\d+单元/)) {
           currentUnit = text;
-        } else if (currentUnit && !text.startsWith('Unit')) {
+        } else if (currentUnit && !text.startsWith('http')) {
           sections.push({ unit: currentUnit, section: text });
+        }
+      }
+      if (sections.length > 0) return sections;
+
+      // ——— 策略2：列表结构 li / .chapter / .section ———
+      const listItems = document.querySelectorAll(
+        '.chapter-list li, .section-list li, .catalog li, .nav-list li, ' +
+        '.course-nav li, .lesson-list li, ul.chapters li, ol.chapters li, ' +
+        '[class*="chapter"] li, [class*="section"] li, [class*="catalog"] li'
+      );
+      if (listItems.length > 0) {
+        let unit = '章节';
+        for (const li of listItems) {
+          const text = li.textContent.trim();
+          if (!text || blackList.includes(text)) continue;
+          const cls = li.className || '';
+          if (cls.includes('unit') || cls.includes('chapter') || cls.includes('title') ||
+              text.match(/^第\d+讲/) || text.match(/^专题/) || text.match(/^Unit\s*\d+/i)) {
+            unit = text.substring(0, 60);
+          } else {
+            sections.push({ unit, section: text.substring(0, 80) });
+          }
+        }
+        if (sections.length > 0) return sections;
+      }
+
+      // ——— 策略3：所有 a 标签，按内容过滤 ———
+      const allLinks = document.querySelectorAll('a');
+      let unit3 = '章节';
+      for (const a of allLinks) {
+        const text = a.textContent.trim();
+        const href = a.getAttribute('href') || '';
+        if (!text || text.length > 80 || blackList.includes(text) || text.startsWith('http')) continue;
+        if (href.startsWith('http') && !href.includes('javascript')) continue;
+        if (text.match(/^第\d+讲/) || text.match(/^专题/) || text.match(/^Unit\s*\d+/i) || text.match(/^第\d+章/)) {
+          unit3 = text.substring(0, 60);
+        } else if (text.length > 2) {
+          sections.push({ unit: unit3, section: text });
         }
       }
       return sections;
     });
-  } catch { return []; }
+  } catch (e) {
+    return [];
+  }
+}
+
+// ============ cstore 平台：获取视频列表 ============
+async function getCstoreSections(page) {
+  return await page.evaluate(() => {
+    const sections = [];
+    // "观看视频" 按钮: <a onclick="previewActivity('1','<uuid>')" class="btnw80 majorButton fl">观看视频</a>
+    const btns = Array.from(document.querySelectorAll('a')).filter(a => {
+      const t = (a.textContent || '').trim();
+      return t === '观看视频' && (a.getAttribute('onclick') || '').includes('previewActivity');
+    });
+
+    // 从按钮向前回溯找到所属 Unit 标题
+    const allLis = Array.from(document.querySelectorAll('li'));
+    btns.forEach((btn, idx) => {
+      // 找到包含该按钮的 li（章节行）
+      let chapterLi = btn.closest('li');
+      if (!chapterLi) return;
+
+      // 章节标题：该 li 里的文字（去掉时长/按钮部分）
+      let title = (chapterLi.textContent || '').replace(/\s+/g, ' ').trim();
+      title = title.replace(/有效时长\/视频时长|观看视频|\d{2}:\d{2}\/\d{2}:\d{2}/g, '').trim();
+
+      // Unit 标题：向前找最近的 .oneChapter li
+      let unit = 'Unit';
+      let prev = chapterLi.previousElementSibling;
+      while (prev) {
+        if (prev.className && prev.className.includes('oneChapter')) {
+          unit = (prev.textContent || '').trim().substring(0, 60);
+          break;
+        }
+        prev = prev.previousElementSibling;
+      }
+
+      // 提取 uuid
+      const onclick = btn.getAttribute('onclick') || '';
+      const m = onclick.match(/previewActivity\(['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\)/);
+      const uuid = m ? m[2] : null;
+
+      sections.push({
+        index: idx,
+        unit,
+        section: title.substring(0, 80),
+        uuid,
+        onclick,
+      });
+    });
+    return sections;
+  });
+}
+
+// ============ cstore 平台：播放器操作 ============
+async function getCstoreVideoInfo(page) {
+  try {
+    return await page.evaluate(() => {
+      const video = document.querySelector('#video_div_video_html5_api')
+        || document.querySelector('.vjs-tech')
+        || document.querySelector('video');
+      if (!video) return null;
+      let playerState = {};
+      if (window.videojs) {
+        try {
+          const ids = Object.keys(window.videojs.players || {});
+          for (const id of ids) {
+            const pl = window.videojs.players[id];
+            if (pl && pl.el && pl.el().contains(video)) {
+              playerState = { playerPaused: pl.paused(), playerEnded: pl.ended() };
+              break;
+            }
+          }
+        } catch {}
+      }
+      return {
+        paused: video.paused, ended: video.ended,
+        currentTime: video.currentTime, duration: video.duration || 0,
+        readyState: video.readyState, ...playerState,
+      };
+    });
+  } catch { return null; }
+}
+
+async function cstorePlayVideo(page) {
+  try {
+    const r = await page.evaluate(() => {
+      const video = document.querySelector('#video_div_video_html5_api')
+        || document.querySelector('.vjs-tech') || document.querySelector('video');
+      if (!video) return { ok: false };
+      // 点击大播放按钮
+      const bigBtn = document.querySelector('.vjs-big-play-button');
+      if (bigBtn && bigBtn.offsetWidth > 0) bigBtn.click();
+      // 点击控制栏播放
+      const ctrl = document.querySelector('.vjs-play-control');
+      if (ctrl) ctrl.click();
+      // Video.js API
+      if (window.videojs) {
+        try {
+          const ids = Object.keys(window.videojs.players || {});
+          for (const id of ids) {
+            const pl = window.videojs.players[id];
+            if (pl && pl.paused()) pl.play().catch(() => {});
+          }
+        } catch {}
+      }
+      if (video.paused) { const pr = video.play(); if (pr && pr.catch) pr.catch(() => {}); }
+      return { ok: true, paused: video.paused, t: video.currentTime };
+    });
+    return r.ok;
+  } catch { return false; }
+}
+
+// ============ cstore 平台：主流程 ============
+async function runCstoreMode(cstorePage, timingPage) {
+  let page = cstorePage;
+
+  // 若当前在列表页，先进入第一个视频
+  const isVideoPage = () => page.url().includes('/activity/video/preview');
+  if (!isVideoPage()) {
+    log('[cstore] 当前在课程列表页，准备进入第一个视频...');
+    const sections = await getCstoreSections(page);
+    log(`[cstore] 共发现 ${sections.length} 个视频:`);
+    sections.slice(0, 20).forEach((s, i) => log(`  [${i + 1}] ${s.unit} - ${s.section}${s.uuid ? '' : ' (无uuid)'}`));
+    if (sections.length === 0) { log('[cstore] ⚠️ 未找到视频列表'); return false; }
+    if (sections.length > 20) log(`  ... 还有 ${sections.length - 20} 个`);
+
+    // 点击第一个"观看视频"
+    await page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll('a')).find(a =>
+        (a.textContent || '').trim() === '观看视频' && (a.getAttribute('onclick') || '').includes('previewActivity'));
+      if (btn) btn.click();
+    });
+    log('[cstore] 已点击第一个「观看视频」');
+    await sleep(6);
+    // 等视频页加载
+    for (let i = 0; i < 20; i++) {
+      if (isVideoPage()) break;
+      await sleep(2);
+    }
+    log(`[cstore] 当前页: ${page.url().substring(0, 110)}`);
+  }
+
+  // 等待播放器
+  log('[cstore] 等待播放器加载...');
+  let info = null;
+  for (let i = 0; i < 30; i++) {
+    info = await getCstoreVideoInfo(page);
+    if (info && info.duration > 0) break;
+    await sleep(2);
+  }
+  if (!info) { log('[cstore] ⚠️ 未找到播放器'); return false; }
+  log(`[cstore] ✅ 播放器就绪，时长 ${formatTime(info.duration)}（${Math.round(info.duration/60)}分钟）`);
+
+  // 获取章节列表（回到列表页获取？不，视频页可能有导航；这里用保存的列表）
+  // 先在视频页尝试获取当前视频标题
+  const currentTitle = await page.evaluate(() => {
+    const el = document.querySelector('.chapterTitle, .videoTitle, h1, h2, .title');
+    return el ? (el.textContent || '').trim().substring(0, 80) : '';
+  });
+  log(`[cstore] 当前视频: ${currentTitle || '(未识别)'}`);
+
+  // 开始播放
+  log('[cstore] 开始播放...');
+  await cstorePlayVideo(page);
+  await sleep(3);
+
+  // 统计信息从计时窗口读取
+  log('');
+  log('[cstore] 📺 计时窗口保持打开中，进入监控...');
+  log('');
+
+  let lastTime = -1;
+  let stuck = 0;
+  let playCounter = 0;
+  let reportedSections = 0;
+
+  while (true) {
+    await sleep(CONFIG.checkInterval);
+    playCounter++;
+
+    // 页面可能被切换（用户手动点别的），保持跟踪 cstore 视频页
+    if (!isVideoPage()) {
+      const vp = context_pages_find_video();
+      if (vp) page = vp;
+    }
+
+    const vinfo = await getCstoreVideoInfo(page);
+    if (!vinfo) {
+      log('[cstore] 播放器丢失，等待...');
+      await sleep(3);
+      continue;
+    }
+
+    const isPaused = vinfo.playerPaused !== undefined ? vinfo.playerPaused : vinfo.paused;
+    const isEnded = vinfo.playerEnded !== undefined ? vinfo.playerEnded : vinfo.ended;
+
+    // 状态日志（每30秒）
+    if (playCounter % 6 === 0) {
+      log(`[cstore状态] paused=${vinfo.paused} ended=${vinfo.ended} rs=${vinfo.readyState} ${formatTime(vinfo.currentTime)}/${formatTime(vinfo.duration)}`);
+    }
+
+    // 暂停恢复 / 定期保活
+    if ((isPaused || playCounter % 6 === 0) && !isEnded) {
+      if (isPaused) log(`[cstore] 视频暂停 ${formatTime(vinfo.currentTime)}，恢复...`);
+      await cstorePlayVideo(page);
+    }
+
+    // 卡顿检测
+    if (vinfo.currentTime > 0 && vinfo.currentTime < vinfo.duration - 1) {
+      if (Math.abs(vinfo.currentTime - lastTime) < 0.5) {
+        stuck++;
+        if (stuck > CONFIG.videoStuckTimeout / CONFIG.checkInterval) {
+          log('[cstore] 视频卡住，尝试恢复...');
+          await cstorePlayVideo(page);
+          stuck = 0;
+        }
+      } else stuck = 0;
+    }
+    lastTime = vinfo.currentTime;
+
+    // 进度
+    if (Date.now() % 30000 < CONFIG.checkInterval * 1000) {
+      const pct = ((vinfo.currentTime / vinfo.duration) * 100).toFixed(1);
+      log(`[cstore进度] ${formatTime(vinfo.currentTime)}/${formatTime(vinfo.duration)} (${pct}%)`);
+    }
+
+    // 视频结束
+    if (isEnded || (vinfo.duration > 0 && vinfo.currentTime >= vinfo.duration - 2)) {
+      completedSections++;
+      reportedSections++;
+      const mins = Math.round(vinfo.duration / 60);
+      totalStudyMinutes += mins;
+      log('');
+      log('  ═════════════════════════════════════');
+      log(`  ✅ 第${completedSections}节完成！+${mins}分钟 | 累计: ${totalStudyMinutes}分钟`);
+      log('  ═════════════════════════════════════');
+      log('');
+      await saveAuthStateAsync(context_global);
+      // 回到列表页，点下一个"观看视频"
+      const advanced = await cstoreNextVideo(page);
+      if (!advanced) {
+        log('[cstore] 🎉 所有视频已学完！');
+        return true;
+      }
+      // 等待新视频加载
+      for (let i = 0; i < 20; i++) {
+        const ni = await getCstoreVideoInfo(page);
+        if (ni && ni.duration > 0 && ni.currentTime < 5) break;
+        await sleep(2);
+      }
+      await cstorePlayVideo(page);
+      lastTime = -1; stuck = 0; playCounter = 0;
+    }
+  }
+}
+
+// 辅助：查找 cstore 视频页
+function context_pages_find_video() {
+  for (const p of context_global.pages()) {
+    if (p.url().includes('cstore.chinaedu.net') && p.url().includes('/activity/video/preview')) return p;
+  }
+  return null;
+}
+
+// 辅助：跳到下一个视频（回列表页点击下一个未完成的"观看视频"）
+async function cstoreNextVideo(page) {
+  // 从视频页返回列表：点"返回"按钮或改 URL
+  const backResult = await page.evaluate(() => {
+    // 常见返回按钮
+    const sels = ['.back', '.fanhui', '[class*="back"]', 'a:has-text("返回")'];
+    for (const sel of sels) {
+      const el = document.querySelector(sel);
+      if (el && el.offsetWidth > 0) { el.click(); return 'clicked:' + sel; }
+    }
+    return null;
+  }).catch(() => null);
+
+  if (!backResult) {
+    // 用 history.back()
+    await page.evaluate(() => history.back()).catch(() => {});
+  }
+  await sleep(4);
+
+  // 若还在视频页，尝试改 URL 到列表页
+  if (page.url().includes('/activity/video/preview')) {
+    const base = page.url().split('/cstore/preview/')[0];
+    // 无法确定列表 URL，尝试 back 两次
+    await page.evaluate(() => history.back()).catch(() => {});
+    await sleep(3);
+  }
+  if (!page.url().includes('index.do')) {
+    await page.evaluate(() => history.back()).catch(() => {});
+    await sleep(3);
+  }
+
+  // 现在应在列表页，找下一个"观看视频"（第 completedSections 个）
+  const targetIdx = completedSections;  // 已完成N节，下一个是索引N
+  const clicked = await page.evaluate((idx) => {
+    const btns = Array.from(document.querySelectorAll('a')).filter(a =>
+      (a.textContent || '').trim() === '观看视频' && (a.getAttribute('onclick') || '').includes('previewActivity'));
+    if (idx >= btns.length) return { ok: false, total: btns.length };
+    btns[idx].click();
+    return { ok: true, total: btns.length, idx };
+  }, targetIdx);
+
+  if (!clicked.ok) {
+    if (targetIdx >= clicked.total) {
+      log(`[cstore] 已到最后一个视频（共${clicked.total}个）`);
+    } else {
+      log(`[cstore] ⚠️ 未找到第${targetIdx + 1}个视频`);
+    }
+    return false;
+  }
+  log(`[cstore] ▶️ 进入第${targetIdx + 1}/${clicked.total}个视频`);
+  await sleep(5);
+  return true;
+}
+
+// ============ 诊断：打印页面链接结构 ============
+async function diagnoseSections(playFrame) {
+  if (!playFrame) return;
+  try {
+    const info = await playFrame.evaluate(() => {
+      // 获取所有可见链接
+      const links = Array.from(document.querySelectorAll('a')).map(a => ({
+        href: a.getAttribute('href') || '',
+        text: a.textContent.trim().substring(0, 60),
+        cls: a.className.substring(0, 40),
+        visible: a.offsetWidth > 0,
+      })).filter(l => l.text.length > 0 && l.visible);
+
+      // 获取列表元素
+      const listEls = Array.from(document.querySelectorAll(
+        'ul li, ol li, [class*="chapter"] *, [class*="section"] *, [class*="catalog"] *, [class*="nav"] *'
+      )).slice(0, 30).map(el => ({
+        tag: el.tagName,
+        text: el.textContent.trim().substring(0, 60),
+        cls: el.className.substring(0, 40),
+      })).filter(e => e.text.length > 0);
+
+      return { links: links.slice(0, 30), listEls: listEls.slice(0, 20) };
+    });
+
+    log('[诊断] ====== playFrame 页面结构 ======');
+    log(`[诊断] 可见链接 (${info.links.length}):`);
+    info.links.forEach((l, i) => {
+      log(`  [${i}] href="${l.href.substring(0, 50)}" class="${l.cls}" text="${l.text}"`);
+    });
+    log(`[诊断] 列表元素 (${info.listEls.length}):`);
+    info.listEls.forEach((e, i) => {
+      log(`  [${i}] <${e.tag}> class="${e.cls}" text="${e.text}"`);
+    });
+    log('[诊断] ============================');
+  } catch (e) {
+    log(`[诊断] 异常: ${e.message}`);
+  }
 }
 
 // ============ 点击下一个章节 ============
@@ -409,20 +836,32 @@ async function clickNextSection(playFrame) {
 
   try {
     const linkInfo = await playFrame.evaluate((tgt) => {
+      // 判断文字是否是 unit 标题
+      function isUnitTitle(text) {
+        return text.match(/^第\d+讲/) || text.match(/^专题[一二三四五六七八九十\d]+/) ||
+               text.match(/^(Unit|unit|UNIT)\s*\d+/i) || text.match(/^第\d+章/) || text.match(/^第\d+单元/);
+      }
+
       const allLinks = Array.from(document.querySelectorAll('a[href="javascript:;"]'));
       let unitIdx = -1, sectionIdx = -1;
       let inTargetUnit = false;
       for (let i = 0; i < allLinks.length; i++) {
         const text = allLinks[i].textContent.trim();
         if (text === tgt.unit) { unitIdx = i; inTargetUnit = true; }
-        else if (text.startsWith('Unit ')) { inTargetUnit = false; }
+        else if (isUnitTitle(text)) { inTargetUnit = false; }
         else if (inTargetUnit && text === tgt.section) { sectionIdx = i; break; }
       }
       return { unitIdx, sectionIdx, found: sectionIdx >= 0 };
     }, target);
 
     if (!linkInfo.found) {
-      log(`[导航] ⚠️ 未找到章节链接`);
+      log(`[导航] ⚠️ 未找到章节链接，尝试重新加载章节列表`);
+      // 重新获取章节列表再试一次
+      const newSections = await getAllSections(playFrame);
+      if (newSections.length > sectionList.length) {
+        sectionList = newSections;
+        log(`[导航] 重新加载到 ${sectionList.length} 个章节`);
+      }
       return false;
     }
 
@@ -529,6 +968,7 @@ async function main() {
     viewport: { width: 1440, height: 900 },
     locale: 'zh-CN',
   });
+  context_global = context;  // 供 cstore 模式使用
 
   // 信号处理
   process.on('SIGINT', async () => {
@@ -550,10 +990,38 @@ async function main() {
   }
   await sleep(3);
 
-  // 检查是否需要登录
-  const needLogin = await page.evaluate(() => {
+  // 检查是否需要登录（密码框存在 或 登录态失效）
+  let needLogin = await page.evaluate(() => {
     return document.querySelectorAll('input[type="password"]').length > 0;
   });
+
+  // 即使没有密码框，也校验登录态是否有效
+  if (!needLogin) {
+    const sessionValid = await page.evaluate(async () => {
+      try {
+        const res = await fetch('/student/student/coursestudy/getlist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: 'aggregation' }),
+        });
+        const text = await res.text();
+        if (text.includes('RedirectToLogin')) return false;
+        const json = JSON.parse(text);
+        return !!(json && (json.items || json.data));
+      } catch {
+        return false;
+      }
+    });
+    if (!sessionValid) {
+      log('[登录] ⚠️ 登录状态已失效，需要重新登录');
+      needLogin = true;
+      // 跳转到登录页
+      try {
+        await page.goto('https://cjstudy.zstu.edu.cn/student/', { waitUntil: 'networkidle', timeout: 30000 });
+      } catch {}
+      await sleep(3);
+    }
+  }
 
   if (needLogin) {
     const loggedIn = await doLogin(page);
@@ -606,16 +1074,49 @@ async function main() {
   const targetCourseName = process.argv[2];
   let courseClicked = false;
 
-  // 策略1: 通过 API 获取课程列表
+  // 策略1: 通过 API 获取课程列表（带重试 + 登录态校验）
   try {
-    const response = await page.evaluate(async () => {
-      const res = await fetch('/student/student/coursestudy/getlist', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: 'aggregation' }),
+    let response = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const raw = await page.evaluate(async () => {
+        try {
+          const res = await fetch('/student/student/coursestudy/getlist', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ data: 'aggregation' }),
+            credentials: 'include',
+          });
+          return await res.text();
+        } catch (e) {
+          return '__FETCH_ERROR__:' + e.message;
+        }
       });
-      return res.json();
-    });
+
+      if (raw.includes('RedirectToLogin')) {
+        log(`[3/5] 第${attempt}次获取失败：登录态失效（RedirectToLogin）`);
+        if (attempt < 3) {
+          log('[3/5] 等待登录态生效后重试...');
+          await sleep(5);
+        }
+        continue;
+      }
+      if (raw.startsWith('__FETCH_ERROR__')) {
+        log(`[3/5] 第${attempt}次请求异常: ${raw.replace('__FETCH_ERROR__:', '')}`);
+        await sleep(3);
+        continue;
+      }
+      try {
+        response = JSON.parse(raw);
+        break;
+      } catch {
+        log(`[3/5] 第${attempt}次返回非JSON: ${raw.substring(0, 80)}`);
+        await sleep(3);
+      }
+    }
+
+    if (!response) {
+      throw new Error('课程列表 API 三次重试均失败（登录态可能失效）');
+    }
 
     if (response && response.items && response.items.length > 0) {
       log(`[3/5] 共 ${response.items.length} 门课程:`);
@@ -627,10 +1128,18 @@ async function main() {
       // 选择课程
       let selectedCourse = null;
       if (targetCourseName) {
-        selectedCourse = response.items.find(c => {
-          const name = (c.courseName || c.bussinessCaseName || '').toLowerCase();
-          return name.includes(targetCourseName.toLowerCase());
-        });
+        const target = targetCourseName.toLowerCase().replace(/\s+/g, '');
+        const getName = (c) => (c.courseName || c.bussinessCaseName || '').replace(/\s+/g, '');
+        // 优先级1：完全相等
+        selectedCourse = response.items.find(c => getName(c).toLowerCase() === target);
+        // 优先级2：卡片名称包含关键词（关键词是完整课程名的一部分）
+        if (!selectedCourse) {
+          selectedCourse = response.items.find(c => getName(c).toLowerCase().includes(target));
+        }
+        // 优先级3：关键词包含课程名（如传"大学英语"匹配"大学英语2"时取第一个）
+        if (!selectedCourse) {
+          selectedCourse = response.items.find(c => target.includes(getName(c).toLowerCase()) && getName(c).length > 2);
+        }
       }
       if (!selectedCourse) {
         // 默认选择第一个未完成的
@@ -655,20 +1164,27 @@ async function main() {
 
         if (targetCourseName && allBts.length > 0) {
           // 有关键词：找匹配课程名的按钮
+          // 优先级：完全包含 > 去掉空格包含 > 逐字包含
+          const norm = (s) => (s || '').replace(/\s+/g, '').toLowerCase();
+          const targetNorm = norm(targetCourseName);
+          let bestIdx = -1;
+          const cardTexts = [];
           for (let i = 0; i < allBts.length; i++) {
             const bt = allBts[i];
-            // 找到按钮所在的课程卡片，获取课程名
             const cardText = await bt.evaluate(el => {
-              // 向上找课程卡片容器
               const card = el.closest('[class*="course"]') || el.parentElement?.parentElement?.parentElement;
-              return card ? card.textContent.trim().substring(0, 100) : '';
+              return card ? card.textContent.trim().replace(/\s+/g, ' ').substring(0, 150) : '';
             });
-            if (cardText.includes(targetCourseName)) {
-              await bt.click();
-              log(`[3/5] 已点击课程: ${courseName} (匹配关键词)`);
-              courseClicked = true;
-              break;
-            }
+            cardTexts.push(cardText);
+            if (bestIdx === -1 && norm(cardText).includes(targetNorm)) bestIdx = i;
+          }
+          log(`[3/5] 课程卡片: ${cardTexts.map((t, i) => `#${i + 1}="${t.substring(0, 25)}"`).join(' | ')}`);
+          if (bestIdx >= 0) {
+            await allBts[bestIdx].click();
+            log(`[3/5] 已点击课程: ${courseName} (匹配 "${targetCourseName}" 于卡片#${bestIdx + 1})`);
+            courseClicked = true;
+          } else {
+            log(`[3/5] ⚠️ 没有卡片匹配 "${targetCourseName}"，将使用 API 选中的课程`);
           }
         }
 
@@ -748,11 +1264,37 @@ async function main() {
   }
 
   if (!courseClicked) {
-    log('[3/5] ⚠️ 无法自动进入课程');
-    log('[3/5] 请手动在浏览器中点击课程进入');
-    log('[3/5] 进入视频播放页后，按 Enter 继续脚本...');
-    // 等待用户按 Enter
-    process.stdin.once('data', () => {});
+    log('');
+    log('  ╔══════════════════════════════════════════════════════╗');
+    log('  ║  ⚠️  无法自动进入课程，需要手动操作                   ║');
+    log('  ║                                                      ║');
+    log('  ║  【如果浏览器停在登录页】                             ║');
+    log('  ║    手动输入账号密码 + 验证码，点登录                  ║');
+    log('  ║  【如果已登录】                                       ║');
+    log('  ║    点击「大学英语2」课程 → 点「课程学习」按钮         ║');
+    log('  ║                                                      ║');
+    log('  ║  完成后回到终端按 Enter 继续脚本                      ║');
+    log('  ╚══════════════════════════════════════════════════════╝');
+    log('');
+
+    // 等待用户按 Enter（60秒后自动继续，容错）
+    await new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      process.stdin.once('data', finish);
+      setTimeout(finish, 300000); // 最多等5分钟
+    });
+
+    // 用户按 Enter 后，重新检测当前页面是否已进入计时窗口/视频页
+    await sleep(2);
+    const allPagesNow = context.pages();
+    for (const p of allPagesNow) {
+      if (p.url().includes('videolearning')) {
+        page = p;
+        log('[3/5] ✅ 检测到计时窗口，继续');
+        break;
+      }
+    }
   }
 
   await sleep(5);
@@ -774,23 +1316,54 @@ async function main() {
         const span = document.querySelector('.openNewPage');
         if (span && span.offsetWidth > 0) {
           span.click();
-          return true;
+          return { clicked: true, by: 'openNewPage' };
         }
         const tipWin = document.querySelector('.tip-win');
         if (tipWin && tipWin.offsetWidth > 0) {
           const anyClickable = tipWin.querySelector('span, a, button');
-          if (anyClickable) { anyClickable.click(); return true; }
+          if (anyClickable) { anyClickable.click(); return { clicked: true, by: 'tip-win' }; }
         }
-        return false;
+        return { clicked: false };
       });
 
-      if (clicked) {
-        log('[4/5] ✅ 已点击"确定"，进入在线看课');
+      if (clicked.clicked) {
+        log(`[4/5] ✅ 已点击"确定"(${clicked.by})，进入在线看课`);
         break;
       }
 
+      // 首次和最后一次尝试时输出诊断
+      if (attempt === 0 || attempt === 9) {
+        const diag = await page.evaluate(() => {
+          const bodyText = (document.body?.innerText || '').replace(/\s+/g, ' ').substring(0, 300);
+          const iframes = Array.from(document.querySelectorAll('iframe')).map(f => ({
+            src: (f.src || '').substring(0, 100),
+            id: f.id,
+            cls: f.className,
+          }));
+          const candidates = Array.from(document.querySelectorAll('[class*="tip"], [class*="win"], [class*="confirm"], [class*="dialog"], button, .btn'))
+            .slice(0, 20)
+            .map(el => ({
+              tag: el.tagName,
+              cls: (el.className || '').toString().substring(0, 50),
+              text: (el.textContent || '').trim().substring(0, 40),
+              visible: el.offsetWidth > 0,
+            }))
+            .filter(e => e.text || e.cls);
+          return { url: location.href.substring(0, 150), bodyText, iframes, candidates };
+        });
+        log(`[4/5] 🔍 诊断 (尝试${attempt + 1}/10):`);
+        log(`  URL: ${diag.url}`);
+        log(`  页面文字: ${diag.bodyText}`);
+        log(`  iframe数量: ${diag.iframes.length}`);
+        diag.iframes.forEach((f, i) => log(`    iframe[${i}] src="${f.src}" id="${f.id}" cls="${f.cls}"`));
+        log(`  候选点击元素: ${diag.candidates.length}`);
+        diag.candidates.forEach((c, i) => log(`    [${i}] <${c.tag}> cls="${c.cls}" text="${c.text}" visible=${c.visible}`));
+      }
+
       if (attempt < 9) await sleep(2);
-    } catch {}
+    } catch (e) {
+      if (attempt === 0) log(`[4/5] 弹框检测异常: ${e.message}`);
+    }
   }
 
   await sleep(5);
@@ -817,9 +1390,27 @@ async function main() {
   // 保存计时窗口引用（后续操作中不要关闭它）
   log(`[4/5] 📺 计时窗口: ${timingPage.url().substring(0, 60)}... (保持打开)`);
 
+  // ========== 优先检测 cstore 平台（大学英语2 等新课程）==========
+  // cstore.chinaedu.net 是单页应用，没有 iframe，用 video.js 播放器
+  const cstorePageEarly = context.pages().find(p => p.url().includes('cstore.chinaedu.net'));
+  if (cstorePageEarly) {
+    log('');
+    log('[平台] 🔍 检测到 cstore 平台（新课程类型），切换到 cstore 模式');
+    log(`[平台] ${cstorePageEarly.url().substring(0, 110)}`);
+    const result = await runCstoreMode(cstorePageEarly, timingPage);
+    if (!result) {
+      log('[平台] ⚠️ cstore 模式运行结束');
+    }
+    await saveAuthState(context);
+    await browser.close();
+    if (logStream) logStream.end();
+    return;
+  }
+
   let videoFrame = null;
   let playFrame = null;
   let retries = 0;
+  let lastDiagRetry = -1;
 
   while (retries < 30) {
     videoFrame = findFrame(videoPage, 'video.html');
@@ -836,10 +1427,43 @@ async function main() {
       }
     }
 
+    // 诊断：每 10 次输出所有页面的 frame 清单
+    if (retries % 10 === 0 && retries !== lastDiagRetry) {
+      lastDiagRetry = retries;
+      log(`[4/5] 🔍 Frame 诊断 (第${retries}次):`);
+      const allPages = context.pages();
+      log(`  标签页总数: ${allPages.length}`);
+      allPages.forEach((p, pi) => {
+        log(`  --- 页面[${pi}]: ${p.url().substring(0, 120)}`);
+        const frames = p.frames();
+        frames.forEach((f, fi) => {
+          log(`      frame[${fi}] url="${(f.url() || '').substring(0, 130)}"`);
+        });
+      });
+    }
+
     await sleep(3);
     retries++;
     if (retries % 5 === 0) {
       log(`[4/5] 还在等待视频播放器... (${retries}/30)`);
+    }
+  }
+
+  // 兜底：如果按 video.html/play.html 找不到，尝试宽松匹配
+  if (!videoFrame && videoPage) {
+    log('[4/5] 尝试宽松匹配 frame...');
+    const allFrames = [];
+    for (const p of context.pages()) {
+      for (const f of p.frames()) allFrames.push({ page: p, frame: f, url: f.url() || '' });
+    }
+    // 找含 video/player/play 的 frame
+    const videoLike = allFrames.find(x => /video|player|m3u8|\.mp4/i.test(x.url));
+    const playLike = allFrames.find(x => /play|nav/i.test(x.url) && x !== videoLike);
+    if (videoLike) {
+      videoFrame = videoLike.frame;
+      videoPage = videoLike.page;
+      playFrame = playLike ? playLike.frame : videoLike.frame;
+      log(`[4/5] ✅ 宽松匹配到视频frame: ${videoLike.url.substring(0, 100)}`);
     }
   }
 
@@ -858,10 +1482,14 @@ async function main() {
   currentSectionIdx = 0;
   if (sections.length > 0) {
     log(`[课程] 共 ${sections.length} 个章节:`);
-    sections.slice(0, 10).forEach((s, i) => {
+    sections.slice(0, 15).forEach((s, i) => {
       log(`  [${i + 1}] ${s.unit} - ${s.section.substring(0, 50)}`);
     });
-    if (sections.length > 10) log(`  ... 还有 ${sections.length - 10} 个`);
+    if (sections.length > 15) log(`  ... 还有 ${sections.length - 15} 个`);
+  } else {
+    log('[课程] ⚠️ 未识别章节列表，开始诊断...');
+    await diagnoseSections(playFrame);
+    log('[课程] 将以单节模式运行，视频播完后等待手动切换');
   }
 
   // ============ Step 5: 开始播放 ============

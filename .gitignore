@@ -1,7 +1,11 @@
 node_modules/
 auth-state.json
+auth-state-zstu.json
+auth-state-zstu.json.bak
 learned-courses.json
 last-url.txt
 study.log
 browser-data/
 .DS_Store
+*-dump.json
+network-log*.json
