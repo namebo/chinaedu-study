@@ -51,6 +51,9 @@ const CONFIG = {
   // 已学记录文件
   learnedFile: path.join(process.env.HOME, 'chinaedu-study', 'learned-courses.json'),
 
+  // cstore 平台已学记录（按视频 uuid + 课程，避免重复刷）
+  cstoreLearnedFile: path.join(process.env.HOME, 'chinaedu-study', 'cstore-learned.json'),
+
   // 日志文件
   logFile: path.join(process.env.HOME, 'chinaedu-study', 'study.log'),
 };
@@ -66,6 +69,37 @@ let logStream = null;
 let sectionList = [];
 let currentSectionIdx = 0;
 let context_global = null;   // 全局 context 引用（cstore 模式需要）
+
+// cstore 已学集合（key: courseVersionId:uuid）
+let cstoreLearned = new Set();
+let cstoreLearnedData = [];
+
+function loadCstoreLearned() {
+  try {
+    if (fs.existsSync(CONFIG.cstoreLearnedFile)) {
+      const data = JSON.parse(fs.readFileSync(CONFIG.cstoreLearnedFile, 'utf8'));
+      if (Array.isArray(data)) {
+        cstoreLearnedData = data;
+        data.forEach(item => { if (item && item.key) cstoreLearned.add(item.key); });
+        log(`[cstore去重] 已加载 ${cstoreLearned.size} 条已学记录`);
+      }
+    }
+  } catch (e) {
+    log(`[cstore去重] 加载失败: ${e.message}`);
+  }
+}
+
+function saveCstoreLearned(entry) {
+  if (!entry || !entry.key || cstoreLearned.has(entry.key)) return;
+  cstoreLearned.add(entry.key);
+  cstoreLearnedData.push({ ...entry, date: new Date().toISOString() });
+  try {
+    fs.writeFileSync(CONFIG.cstoreLearnedFile, JSON.stringify(cstoreLearnedData, null, 2));
+    log(`[cstore去重] 已保存: ${entry.title || entry.key}`);
+  } catch (e) {
+    log(`[cstore去重] 保存失败: ${e.message}`);
+  }
+}
 
 // cstore 模式的登录状态保存（复用 saveAuthState 需要 context）
 async function saveAuthStateAsync(ctx) {
@@ -580,23 +614,41 @@ async function cstorePlayVideo(page) {
 async function runCstoreMode(cstorePage, timingPage) {
   let page = cstorePage;
 
-  // 若当前在列表页，先进入第一个视频
+  // 课程标识（用于去重 key）
+  const courseMatch = page.url().match(/courseVersionId=([^&]+)/);
+  const courseId = courseMatch ? courseMatch[1] : 'unknown';
+
+  // 若当前在列表页，先进入第一个未学的视频
   const isVideoPage = () => page.url().includes('/activity/video/preview');
   if (!isVideoPage()) {
-    log('[cstore] 当前在课程列表页，准备进入第一个视频...');
+    log('[cstore] 当前在课程列表页，准备进入视频...');
     const sections = await getCstoreSections(page);
     log(`[cstore] 共发现 ${sections.length} 个视频:`);
-    sections.slice(0, 20).forEach((s, i) => log(`  [${i + 1}] ${s.unit} - ${s.section}${s.uuid ? '' : ' (无uuid)'}`));
-    if (sections.length === 0) { log('[cstore] ⚠️ 未找到视频列表'); return false; }
-    if (sections.length > 20) log(`  ... 还有 ${sections.length - 20} 个`);
-
-    // 点击第一个"观看视频"
-    await page.evaluate(() => {
-      const btn = Array.from(document.querySelectorAll('a')).find(a =>
-        (a.textContent || '').trim() === '观看视频' && (a.getAttribute('onclick') || '').includes('previewActivity'));
-      if (btn) btn.click();
+    sections.forEach((s, i) => {
+      const key = `${courseId}:${s.uuid}`;
+      const done = cstoreLearned.has(key);
+      log(`  [${i + 1}]${done ? ' ✅已学' : ''} ${s.unit} - ${s.section}${s.uuid ? '' : ' (无uuid)'}`);
     });
-    log('[cstore] 已点击第一个「观看视频」');
+    if (sections.length === 0) { log('[cstore] ⚠️ 未找到视频列表'); return false; }
+
+    // 找到第一个未学的索引
+    let startIdx = sections.findIndex(s => !cstoreLearned.has(`${courseId}:${s.uuid}`));
+    if (startIdx < 0) {
+      log('[cstore] 🎉 所有视频都已学过，无需重复刷！');
+      return true;
+    }
+    log(`[cstore] 从第 ${startIdx + 1}/${sections.length} 个视频开始（跳过已学 ${startIdx} 个）`);
+
+    // 点击第 startIdx 个"观看视频"
+    const clicked = await page.evaluate((idx) => {
+      const btns = Array.from(document.querySelectorAll('a')).filter(a =>
+        (a.textContent || '').trim() === '观看视频' && (a.getAttribute('onclick') || '').includes('previewActivity'));
+      if (idx >= btns.length) return false;
+      btns[idx].click();
+      return true;
+    }, startIdx);
+    if (!clicked) { log('[cstore] ⚠️ 无法点击视频按钮'); return false; }
+    log(`[cstore] 已点击第 ${startIdx + 1} 个「观看视频」`);
     await sleep(6);
     // 等视频页加载
     for (let i = 0; i < 20; i++) {
@@ -619,10 +671,11 @@ async function runCstoreMode(cstorePage, timingPage) {
 
   // 获取章节列表（回到列表页获取？不，视频页可能有导航；这里用保存的列表）
   // 先在视频页尝试获取当前视频标题
-  const currentTitle = await page.evaluate(() => {
+  const readTitle = async () => await page.evaluate(() => {
     const el = document.querySelector('.chapterTitle, .videoTitle, h1, h2, .title');
     return el ? (el.textContent || '').trim().substring(0, 80) : '';
-  });
+  }).catch(() => '');
+  let currentTitle = await readTitle();
   log(`[cstore] 当前视频: ${currentTitle || '(未识别)'}`);
 
   // 开始播放
@@ -696,6 +749,17 @@ async function runCstoreMode(cstorePage, timingPage) {
       reportedSections++;
       const mins = Math.round(vinfo.duration / 60);
       totalStudyMinutes += mins;
+
+      // 读取当前视频的 uuid（URL 参数 courseActivityId）并记录去重
+      const curUuid = await page.evaluate(() => {
+        const m = location.href.match(/courseActivityId=([^&]+)/);
+        return m ? decodeURIComponent(m[1]) : null;
+      }).catch(() => null);
+      const curTitle = currentTitle || `视频${completedSections}`;
+      if (curUuid) {
+        saveCstoreLearned({ key: `${courseId}:${curUuid}`, uuid: curUuid, courseId, title: curTitle, minutes: mins });
+      }
+
       log('');
       log('  ═════════════════════════════════════');
       log(`  ✅ 第${completedSections}节完成！+${mins}分钟 | 累计: ${totalStudyMinutes}分钟`);
@@ -714,6 +778,8 @@ async function runCstoreMode(cstorePage, timingPage) {
         if (ni && ni.duration > 0 && ni.currentTime < 5) break;
         await sleep(2);
       }
+      currentTitle = await readTitle();
+      log(`[cstore] 当前视频: ${currentTitle || '(未识别)'}`);
       await cstorePlayVideo(page);
       lastTime = -1; stuck = 0; playCounter = 0;
     }
@@ -728,12 +794,11 @@ function context_pages_find_video() {
   return null;
 }
 
-// 辅助：跳到下一个视频（回列表页点击下一个未完成的"观看视频"）
+// 辅助：跳到下一个未学视频（回列表页，按 uuid 跳过已学）
 async function cstoreNextVideo(page) {
-  // 从视频页返回列表：点"返回"按钮或改 URL
+  // 从视频页返回列表：点"返回"按钮或 history.back()
   const backResult = await page.evaluate(() => {
-    // 常见返回按钮
-    const sels = ['.back', '.fanhui', '[class*="back"]', 'a:has-text("返回")'];
+    const sels = ['.back', '.fanhui', '[class*="back"]'];
     for (const sel of sels) {
       const el = document.querySelector(sel);
       if (el && el.offsetWidth > 0) { el.click(); return 'clicked:' + sel; }
@@ -742,42 +807,42 @@ async function cstoreNextVideo(page) {
   }).catch(() => null);
 
   if (!backResult) {
-    // 用 history.back()
     await page.evaluate(() => history.back()).catch(() => {});
   }
   await sleep(4);
 
-  // 若还在视频页，尝试改 URL 到列表页
-  if (page.url().includes('/activity/video/preview')) {
-    const base = page.url().split('/cstore/preview/')[0];
-    // 无法确定列表 URL，尝试 back 两次
-    await page.evaluate(() => history.back()).catch(() => {});
-    await sleep(3);
-  }
-  if (!page.url().includes('index.do')) {
+  // 若还在视频页，多次 back 回列表
+  for (let i = 0; i < 3 && page.url().includes('/activity/video/preview'); i++) {
     await page.evaluate(() => history.back()).catch(() => {});
     await sleep(3);
   }
 
-  // 现在应在列表页，找下一个"观看视频"（第 completedSections 个）
-  const targetIdx = completedSections;  // 已完成N节，下一个是索引N
-  const clicked = await page.evaluate((idx) => {
+  // 回到列表页，重新解析按钮 + uuid，找第一个未学的
+  const courseMatch = page.url().match(/courseVersionId=([^&]+)/);
+  const courseId = courseMatch ? courseMatch[1] : 'unknown';
+  const learnedArr = Array.from(cstoreLearned);
+
+  const result = await page.evaluate((learnedList) => {
     const btns = Array.from(document.querySelectorAll('a')).filter(a =>
       (a.textContent || '').trim() === '观看视频' && (a.getAttribute('onclick') || '').includes('previewActivity'));
-    if (idx >= btns.length) return { ok: false, total: btns.length };
-    btns[idx].click();
-    return { ok: true, total: btns.length, idx };
-  }, targetIdx);
-
-  if (!clicked.ok) {
-    if (targetIdx >= clicked.total) {
-      log(`[cstore] 已到最后一个视频（共${clicked.total}个）`);
-    } else {
-      log(`[cstore] ⚠️ 未找到第${targetIdx + 1}个视频`);
+    for (let i = 0; i < btns.length; i++) {
+      const onclick = btns[i].getAttribute('onclick') || '';
+      const m = onclick.match(/previewActivity\(['"][^'"]+['"]\s*,\s*['"]([^'"]+)['"]\)/);
+      const uuid = m ? m[1] : null;
+      if (!uuid) continue;
+      if (!learnedList.includes(uuid)) {
+        btns[i].click();
+        return { ok: true, idx: i, total: btns.length, uuid };
+      }
     }
+    return { ok: false, total: btns.length };
+  }, learnedArr.map(k => k.split(':').pop()));
+
+  if (!result.ok) {
+    log(`[cstore] 已无可刷视频（共${result.total}个，已全部学过）`);
     return false;
   }
-  log(`[cstore] ▶️ 进入第${targetIdx + 1}/${clicked.total}个视频`);
+  log(`[cstore] ▶️ 进入第${result.idx + 1}/${result.total}个视频 (uuid=${result.uuid.substring(0, 8)}...)`);
   await sleep(5);
   return true;
 }
@@ -941,6 +1006,7 @@ async function main() {
   log('');
 
   loadLearned();
+  loadCstoreLearned();
 
   // 启动浏览器
   const browser = await chromium.launch({

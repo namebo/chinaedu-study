@@ -9,3 +9,4 @@ browser-data/
 .DS_Store
 *-dump.json
 network-log*.json
+cstore-learned.json
