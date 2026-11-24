@@ -443,6 +443,52 @@ async function getAllSections(playFrame) {
       const blackList = ['首页', '课程讲解', '展开', '更多', '目录', '视频', '语音',
         '登录', '退出', '个人中心', '注销', '返回', '上一页', '下一页', '关闭'];
 
+      // ——— 策略0（最高优先级）：弘成经典树形导航 li.leftOneLevel / li.leftTwoLevel ———
+      // 结构：li.leftOneLevel（章）> ul.sub-menu > li.leftTwoLevel（节）
+      const oneLevels = document.querySelectorAll('li.leftOneLevel, li.leftTwoLevel');
+      if (oneLevels.length > 0) {
+        let currentUnit = '';
+        for (const li of oneLevels) {
+          const isOne = li.className.includes('leftOneLevel');
+          // 只取直接文本（排除子菜单文字）
+          let directText = '';
+          for (const node of li.childNodes) {
+            if (node.nodeType === 3) directText += node.textContent; // 文本节点
+            else if (node.nodeType === 1 && !node.className.includes('sub-menu') &&
+                     node.tagName !== 'UL' && !node.querySelector?.('ul')) {
+              directText += node.textContent;
+            }
+          }
+          directText = directText.replace(/\s+/g, ' ').trim();
+          // 过滤：空、黑名单、未渲染的 Vue 模板（{{...}}）
+          if (!directText || blackList.includes(directText) || /\{\{.*\}\}/.test(directText)) continue;
+
+          if (isOne) {
+            currentUnit = directText;
+          } else {
+            // leftTwoLevel = 节
+            sections.push({ unit: currentUnit || '课程讲解', section: directText });
+          }
+        }
+        // 若 leftOneLevel 本身也是可点章节（无子节的情况，如"第五章 全面深化改革开放"）
+        // 补充：把没有子节的 leftOneLevel 也作为一节
+        for (const li of document.querySelectorAll('li.leftOneLevel')) {
+          const subMenu = li.querySelector('ul.sub-menu');
+          const hasTwo = subMenu && subMenu.querySelector('li.leftTwoLevel');
+          if (!hasTwo) {
+            let directText = '';
+            for (const node of li.childNodes) {
+              if (node.nodeType === 3) directText += node.textContent;
+            }
+            directText = directText.replace(/\s+/g, ' ').trim();
+            if (directText && !blackList.includes(directText) && !/\{\{.*\}\}/.test(directText)) {
+              sections.push({ unit: directText, section: '(整章)' });
+            }
+          }
+        }
+        if (sections.length > 0) return sections;
+      }
+
       // ——— 策略1：a[href="javascript:;"]，识别"第X讲"为 unit，子节为 section ———
       const links1 = document.querySelectorAll('a[href="javascript:;"]');
       let currentUnit = '';
@@ -900,6 +946,58 @@ async function clickNextSection(playFrame) {
   log(`[导航] 切换到第 ${currentSectionIdx + 1}/${sectionList.length} 节: ${target.section} (${target.unit})`);
 
   try {
+    // 优先：弘成树形导航（li.leftTwoLevel）——按文本精确定位点击
+    const treeResult = await playFrame.evaluate((tgt) => {
+      const list = Array.from(document.querySelectorAll('li.leftTwoLevel, li.leftOneLevel'));
+      if (list.length === 0) return { attempted: false };
+      // 精确匹配 section 文本
+      let el = list.find(li => {
+        if (!li.className.includes('leftTwoLevel')) return false;
+        // 直接文本
+        let t = '';
+        for (const n of li.childNodes) if (n.nodeType === 3) t += n.textContent;
+        t = t.replace(/\s+/g, ' ').trim();
+        if (t === tgt.section) return true;
+        // fallback：整行文本包含
+        return (li.textContent || '').replace(/\s+/g, ' ').trim().includes(tgt.section);
+      });
+      // 整章类型（section = '(整章)'）
+      if (!el && tgt.section === '(整章)') {
+        el = list.find(li => {
+          if (!li.className.includes('leftOneLevel')) return false;
+          let t = '';
+          for (const n of li.childNodes) if (n.nodeType === 3) t += n.textContent;
+          return t.replace(/\s+/g, ' ').trim() === tgt.unit;
+        });
+      }
+      if (!el) return { attempted: true, found: false };
+
+      // 若是二级，先确保父级展开
+      const parentOne = el.closest('li.leftOneLevel');
+      if (parentOne) {
+        const sub = parentOne.querySelector('ul.sub-menu');
+        if (sub && (sub.style.display === 'none' || sub.offsetHeight === 0)) {
+          // 点击父级展开
+          const parentA = parentOne.querySelector('a') || parentOne;
+          try { parentA.click(); } catch {}
+        }
+      }
+
+      // 找到可点击元素（li 内的 a）
+      const clickable = el.querySelector('a') || el;
+      try { clickable.click(); } catch {}
+      return { attempted: true, found: true };
+    }, target);
+
+    if (treeResult.attempted && treeResult.found) {
+      log(`[导航] ✅ 已点击(树形): ${target.section}`);
+      return true;
+    }
+    if (treeResult.attempted && !treeResult.found) {
+      log(`[导航] ⚠️ 树形导航未找到目标: ${target.section}`);
+      return false;
+    }
+
     const linkInfo = await playFrame.evaluate((tgt) => {
       // 判断文字是否是 unit 标题
       function isUnitTitle(text) {
